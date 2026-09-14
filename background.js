@@ -1,13 +1,34 @@
 // Kimi Conversation Exporter
+// Firefox MV3 background script: exports Kimi.ai chats as Markdown/JSON/ZIP.
+
+// --- State ---
 
 var authToken = null;
 var activeExport = null;
 var exportPorts = [];
 
+var PUA = /[\ue000-\uf8ff]/g;
+var KIMI_HEADERS = {
+  'Content-Type': 'application/json',
+  'connect-protocol-version': '1',
+  'x-msh-platform': 'web',
+  'x-msh-version': '1.0.0',
+  'x-language': 'en-US'
+};
+
+// Default export options (synced from storage on startup).
+var opts = { thinking: false, tools: false, refs: true, format: 'both' };
+
+// --- Messaging (progress broadcast + port lifecycle) ---
+
 function broadcast(type, data) {
   exportPorts = exportPorts.filter(function(p) {
-    try { p.postMessage(Object.assign({type: type}, data)); return true; }
-    catch(e) { return false; }
+    try {
+      p.postMessage(Object.assign({ type: type }, data));
+      return true;
+    } catch (e) {
+      return false;
+    }
   });
 }
 
@@ -20,272 +41,542 @@ browser.runtime.onConnect.addListener(function(port) {
 
   // Send current status if an export is already running
   if (activeExport) {
-    broadcast('progress', {pct: activeExport.pct, text: activeExport.text});
+    broadcast('progress', { pct: activeExport.pct, text: activeExport.text });
   }
 
   port.onMessage.addListener(async function(msg) {
-    var s = await browser.storage.local.get(['thinking','tools','format']);
-    var opt = {thinking:s.thinking||false,tools:s.tools||false,refs:true,format:s.format||'both'};
+    var s = await browser.storage.local.get(['thinking', 'tools', 'format']);
+    var opt = { thinking: s.thinking || false, tools: s.tools || false, refs: true, format: s.format || 'both' };
     if (msg.options) opt = msg.options;
     try {
       if (msg.type === 'exportSingle') {
-        activeExport = {pct:0, text:''};
+        activeExport = { pct: 0, text: '' };
         await exportChat(msg.chatId, opt);
         activeExport = null;
-        broadcast('done',{ok:true});
-      }
-      else if (msg.type === 'exportBatch') {
+        broadcast('done', { ok: true });
+      } else if (msg.type === 'exportBatch') {
         if (activeExport) return; // already running
-        activeExport = {pct:0, text:'0/0'};
-        await exportAllWithProgress(msg.chatIds||[], opt);
+        activeExport = { pct: 0, text: '0/0' };
+        await exportAllWithProgress(msg.chatIds || [], opt);
         activeExport = null;
-        broadcast('done',{ok:true});
+        broadcast('done', { ok: true });
       }
-    } catch(e) { activeExport = null; broadcast('done',{ok:false,error:e.message}); }
+    } catch (e) {
+      activeExport = null;
+      broadcast('done', { ok: false, error: e.message });
+    }
   });
 });
+
+// --- Runtime message handling ---
 
 browser.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   if (msg.type === 'setToken' && msg.token) authToken = msg.token;
   if (msg.type === 'getChatInfo') { handleGetChatInfo(msg.chatId).then(sendResponse); return true; }
   if (msg.type === 'getChatText') { handleGetChatText(msg.chatId, msg.options).then(sendResponse); return true; }
   if (msg.type === 'listChats') { handleListChats().then(sendResponse); return true; }
-  if (msg.type === 'exportSingle') { exportChat(msg.chatId, msg.options||{}).then(function(){sendResponse({ok:true});}).catch(function(e){sendResponse({ok:false,error:e.message});}); return true; }
-  if (msg.type === 'exportBatch') { exportAll(msg.options||{}).then(function(){sendResponse({ok:true});}).catch(function(e){sendResponse({ok:false,error:e.message});}); return true; }
+  if (msg.type === 'exportSingle') {
+    exportChat(msg.chatId, msg.options || {})
+      .then(function() { sendResponse({ ok: true }); })
+      .catch(function(e) { sendResponse({ ok: false, error: e.message }); });
+    return true;
+  }
+  if (msg.type === 'exportBatch') {
+    exportAll(msg.options || {})
+      .then(function() { sendResponse({ ok: true }); })
+      .catch(function(e) { sendResponse({ ok: false, error: e.message }); });
+    return true;
+  }
 });
 
-function nextToken(d){return d.nextPageToken||d.next_page_token||d.nextToken||d.next_token||null;}
+// --- API client ---
 
-async function listAllChats(){
-  var chats=[],token=null,guard=0;
-  do{
-    var body=token?{page_size:50,page_token:token,query:''}:{page_size:50,query:''};
-    var d=await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats',body);
-    var page=d.chats||[];
-    if(!page.length)break;
-    chats=chats.concat(page);
-    token=nextToken(d);
-    if(token&&page.length<50)break; // no more pages
-    if(++guard>200)break; // safety
-  }while(token);
+async function getToken() {
+  if (authToken) return authToken;
+  var tabs = await browser.tabs.query({ url: 'https://www.kimi.com/*' });
+  if (!tabs.length) return null;
+  return new Promise(function(resolve) {
+    browser.scripting.executeScript({
+      target: { tabId: tabs[0].id },
+      func: function() { return localStorage.getItem('access_token'); }
+    }).then(function(results) {
+      if (results && results[0] && results[0].result) authToken = results[0].result;
+      resolve(authToken);
+    });
+  });
+}
+
+async function kimiFetch(endpoint, body) {
+  var token = await getToken();
+  var headers = Object.assign({}, KIMI_HEADERS);
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  var r = await fetch('https://www.kimi.com' + endpoint, {
+    method: 'POST',
+    headers: headers,
+    body: JSON.stringify(body),
+    credentials: 'include'
+  });
+  if (!r.ok) {
+    var text = await r.text();
+    if (r.status === 401 || r.status === 403) throw new Error('Not logged into Kimi');
+    throw new Error('API error ' + r.status + ': ' + text.substring(0, 100));
+  }
+  return r.json();
+}
+
+// --- Chat listing ---
+
+// Tolerant next-page token extraction (response field naming varies).
+function nextToken(d) {
+  return d.nextPageToken || d.next_page_token || d.nextToken || d.next_token || null;
+}
+
+// Paginated ListChats: page_size 50, stops on empty page or after 200 pages.
+async function listAllChats() {
+  var chats = [];
+  var token = null;
+  var guard = 0;
+  do {
+    var body = token ? { page_size: 50, page_token: token, query: '' } : { page_size: 50, query: '' };
+    var d = await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats', body);
+    var page = d.chats || [];
+    if (!page.length) break;
+    chats = chats.concat(page);
+    token = nextToken(d);
+    if (token && page.length < 50) break; // no more pages
+    if (++guard > 200) break; // safety
+  } while (token);
   return chats;
 }
 
 async function handleGetChatInfo(chatId) {
   try {
-    var name=chatId,createTime=null;
-    var chats=await listAllChats();
-    var f=chats.find(function(c){return c.id===chatId;});
-    if(f){name=f.name;createTime=f.createTime;}
-    var data=await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages',{chatId:chatId});var msgs=data.messages||[];
-    return{ok:true,title:name,messageCount:msgs.length,date:createTime||(msgs.length?msgs[msgs.length-1].createTime:'Unknown')};
-  }catch(e){return{ok:false,error:e.message};}
+    var name = chatId;
+    var createTime = null;
+    var chats = await listAllChats();
+    var found = chats.find(function(c) { return c.id === chatId; });
+    if (found) {
+      name = found.name;
+      createTime = found.createTime;
+    }
+    var data = await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages', { chatId: chatId });
+    var msgs = data.messages || [];
+    return {
+      ok: true,
+      title: name,
+      messageCount: msgs.length,
+      date: createTime || (msgs.length ? msgs[msgs.length - 1].createTime : 'Unknown')
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 async function handleListChats() {
   try {
-    var chats=await listAllChats();
-    return{ok:true,chats:chats.map(function(c){return{id:c.id,name:c.name,createTime:c.createTime,updateTime:c.updateTime};})};
-  }catch(e){return{ok:false,error:e.message};}
+    var chats = await listAllChats();
+    return {
+      ok: true,
+      chats: chats.map(function(c) {
+        return { id: c.id, name: c.name, createTime: c.createTime, updateTime: c.updateTime };
+      })
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
-async function handleGetChatText(chatId, opts) {
+async function handleGetChatText(chatId, options) {
   try {
-    var name=chatId;
-    var chats=await listAllChats();
-    var f=chats.find(function(c){return c.id===chatId;});
-    if(f)name=f.name;
-    var data=await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages',{chatId:chatId});
-    var msgs=data.messages||[];
-    if(!msgs.length)return{ok:false,error:'No messages'};
-    var mergedOpts={thinking:opts.thinking||false,tools:opts.tools||false,refs:true,format:'both'};
-    var md=buildMD(msgs,name,chatId,mergedOpts);
-    return{ok:true,text:md};
-  }catch(e){return{ok:false,error:e.message};}
+    var name = chatId;
+    var chats = await listAllChats();
+    var found = chats.find(function(c) { return c.id === chatId; });
+    if (found) name = found.name;
+    var data = await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages', { chatId: chatId });
+    var msgs = data.messages || [];
+    if (!msgs.length) return { ok: false, error: 'No messages' };
+    var mergedOpts = { thinking: options.thinking || false, tools: options.tools || false, refs: true, format: 'both' };
+    var md = buildMD(msgs, name, chatId, mergedOpts);
+    return { ok: true, text: md };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
-// --- ZIP Creator ---
-function createZip(files) {
-  var encoder=new TextEncoder(),centralDir=[],localHeaders=[],offset=0;
-  files.forEach(function(f){
-    var data=typeof f.data==='string'?encoder.encode(f.data):f.data,nameBytes=encoder.encode(f.name);
-    var local=new Uint8Array(30+nameBytes.length+data.length),lv=new DataView(local.buffer);
-    lv.setUint32(0,0x04034b50,true);lv.setUint16(4,20,true);lv.setUint16(6,0,true);lv.setUint16(8,0,true);lv.setUint16(10,0,true);lv.setUint16(12,0,true);
-    lv.setUint32(14,crc32(data),true);lv.setUint32(18,data.length,true);lv.setUint32(22,data.length,true);lv.setUint16(26,nameBytes.length,true);lv.setUint16(28,0,true);
-    local.set(nameBytes,30);local.set(data,30+nameBytes.length);localHeaders.push(local);
-    var cd=new Uint8Array(46+nameBytes.length),cv=new DataView(cd.buffer);
-    cv.setUint32(0,0x02014b50,true);cv.setUint16(4,20,true);cv.setUint16(6,20,true);cv.setUint16(8,0,true);cv.setUint16(10,0,true);cv.setUint16(12,0,true);
-    cv.setUint16(14,0,true);cv.setUint32(16,crc32(data),true);cv.setUint32(20,data.length,true);cv.setUint32(24,data.length,true);cv.setUint16(28,nameBytes.length,true);cv.setUint16(30,0,true);
-    cv.setUint16(32,0,true);cv.setUint16(34,0,true);cv.setUint32(38,0,true);cv.setUint32(42,offset,true);cd.set(nameBytes,46);centralDir.push(cd);offset+=local.length;
+// --- Markdown builder ---
+
+function strip(s) {
+  return (s || '').replace(PUA, '');
+}
+
+function safeFn(n) {
+  return (n || 'untitled')
+    .replace(/[\\/:*?"<>|]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .substring(0, 80) || 'untitled';
+}
+
+function walkMsgs(msgs) {
+  var map = new Map();
+  msgs.forEach(function(m) { map.set(m.id, m); });
+  var root = msgs.find(function(m) {
+    return m.parentId === '00000000-0000-0000-0000-000000000000' || m.role === 'system';
   });
-  var cdOffset=offset,cdSize=0;centralDir.forEach(function(c){cdSize+=c.length;});
-  var eocd=new Uint8Array(22),ev=new DataView(eocd.buffer);
-  ev.setUint32(0,0x06054b50,true);ev.setUint16(8,files.length,true);ev.setUint16(10,files.length,true);ev.setUint32(12,cdSize,true);ev.setUint32(16,cdOffset,true);
-  var result=new Uint8Array(offset+cdSize+22),pos=0;
-  localHeaders.forEach(function(l){result.set(l,pos);pos+=l.length;});centralDir.forEach(function(c){result.set(c,pos);pos+=c.length;});result.set(eocd,pos);
-  return result;
-}
-function crc32(data){var crc=0xFFFFFFFF,arr=typeof data==='string'?new TextEncoder().encode(data):data;for(var i=0;i<arr.length;i++){crc^=arr[i];for(var j=0;j<8;j++)crc=(crc>>>1)^(crc&1?0xEDB88320:0);}return(crc^0xFFFFFFFF)>>>0;}
-
-var PUA=/[\ue000-\uf8ff]/g;
-function strip(s){return(s||'').replace(PUA,'');}
-function safeFn(n){return(n||'untitled').replace(/[\\/:*?"<>|]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,80)||'untitled';}
-
-var KIMI_HEADERS={'Content-Type':'application/json','connect-protocol-version':'1','x-msh-platform':'web','x-msh-version':'1.0.0','x-language':'en-US'};
-
-async function getToken(){if(authToken)return authToken;var tabs=await browser.tabs.query({url:'https://www.kimi.com/*'});if(tabs.length)return new Promise(function(resolve){browser.scripting.executeScript({target:{tabId:tabs[0].id},func:function(){return localStorage.getItem('access_token');}}).then(function(results){if(results&&results[0]&&results[0].result)authToken=results[0].result;resolve(authToken);});});return null;}
-
-async function kimiFetch(endpoint,body){
-  var token=await getToken(),headers=Object.assign({},KIMI_HEADERS);
-  if(token)headers['Authorization']='Bearer '+token;
-  var r=await fetch('https://www.kimi.com'+endpoint,{method:'POST',headers:headers,body:JSON.stringify(body),credentials:'include'});
-  if(!r.ok){var t=await r.text();throw new Error(r.status===401||r.status===403?'Not logged into Kimi':'API error '+r.status+': '+t.substring(0,100));}
-  return r.json();
-}
-
-function walkMsgs(msgs){
-  var map=new Map();msgs.forEach(function(m){map.set(m.id,m);});
-  var root=msgs.find(function(m){return m.parentId==='00000000-0000-0000-0000-000000000000'||m.role==='system';});
-  if(!root)return[].concat(msgs).reverse();
-  var res=[];function w(id){var m=map.get(id);if(!m)return;if(m.role!=='system')res.push(m);(m.childrenMessageIds||[]).forEach(w);}
-  if(root.role==='system')(root.childrenMessageIds||[]).forEach(w);else{res.push(root);(root.childrenMessageIds||[]).forEach(w);}
+  if (!root) return [].concat(msgs).reverse();
+  var res = [];
+  function walk(id) {
+    var m = map.get(id);
+    if (!m) return;
+    if (m.role !== 'system') res.push(m);
+    (m.childrenMessageIds || []).forEach(walk);
+  }
+  if (root.role === 'system') {
+    (root.childrenMessageIds || []).forEach(walk);
+  } else {
+    res.push(root);
+    (root.childrenMessageIds || []).forEach(walk);
+  }
   return res;
 }
 
-function buildMD(msgs,title,chatId,opts){
-  var ord=walkMsgs(msgs),dt=msgs[msgs.length-1]?msgs[msgs.length-1].createTime:'Unknown';
-  var md='# Kimi: '+strip(title)+'\n**Date:** '+dt+'\n**Chat ID:** '+chatId+'\n**Messages:** '+ord.length+'\n\n---\n\n',refs=[];
-  ord.forEach(function(m){
-    var role=m.role==='user'?'User':m.role==='assistant'?'Kimi':'System',parts=[];
-    (m.blocks||[]).forEach(function(b){
-      if(b.text&&b.text.content)parts.push(strip(b.text.content));
-      else if(b.file&&b.file.meta)parts.push('📎 **'+strip(b.file.meta.name)+'** ('+(b.file.meta.sizeBytes||'?')+' bytes)');
-      else if(b.think&&b.think.content&&opts.thinking)parts.push('<details>\n<summary>💭 Thinking</summary>\n\n'+strip(b.think.content)+'\n</details>');
-      else if(b.tool&&b.tool.name&&opts.tools)parts.push('_🔧 '+b.tool.name+'_');
+function buildMD(msgs, title, chatId, options) {
+  var ord = walkMsgs(msgs);
+  var dt = msgs[msgs.length - 1] ? msgs[msgs.length - 1].createTime : 'Unknown';
+  var md = '# Kimi: ' + strip(title) + '\n'
+    + '**Date:** ' + dt + '\n'
+    + '**Chat ID:** ' + chatId + '\n'
+    + '**Messages:** ' + ord.length + '\n\n---\n\n';
+  var refs = [];
+  ord.forEach(function(m) {
+    var role = m.role === 'user' ? 'User' : m.role === 'assistant' ? 'Kimi' : 'System';
+    var parts = [];
+    (m.blocks || []).forEach(function(b) {
+      if (b.text && b.text.content) parts.push(strip(b.text.content));
+      else if (b.file && b.file.meta) parts.push('📎 **' + strip(b.file.meta.name) + '** (' + (b.file.meta.sizeBytes || '?') + ' bytes)');
+      else if (b.think && b.think.content && options.thinking) parts.push('<details>\n<summary>💭 Thinking</summary>\n\n' + strip(b.think.content) + '\n</details>');
+      else if (b.tool && b.tool.name && options.tools) parts.push('_🔧 ' + b.tool.name + '_');
     });
-    if(!parts.length)return;
-    md+='### '+role+'\n'+parts.join('\n\n')+'\n\n';
-    if(opts.refs&&m.references)m.references.forEach(function(r){(r.items||[]).forEach(function(i){if(i.search&&i.search.base&&i.search.base.url)refs.push({t:i.search.base.title||i.search.base.url,u:i.search.base.url});});});
+    if (!parts.length) return;
+    md += '### ' + role + '\n' + parts.join('\n\n') + '\n\n';
+    if (options.refs && m.references) {
+      m.references.forEach(function(r) {
+        (r.items || []).forEach(function(i) {
+          if (i.search && i.search.base && i.search.base.url) {
+            refs.push({ t: i.search.base.title || i.search.base.url, u: i.search.base.url });
+          }
+        });
+      });
+    }
   });
-  if(opts.refs&&refs.length){var seen=new Set();md+='## References\n\n';refs.forEach(function(r){if(!seen.has(r.u)){seen.add(r.u);md+='- ['+strip(r.t)+']('+r.u+')\n';}});}
+  if (options.refs && refs.length) {
+    var seen = new Set();
+    md += '## References\n\n';
+    refs.forEach(function(r) {
+      if (!seen.has(r.u)) {
+        seen.add(r.u);
+        md += '- [' + strip(r.t) + '](' + r.u + ')\n';
+      }
+    });
+  }
   return md;
 }
 
-async function exportChat(chatId,opts){
-  var name=chatId;
-  var chats=await listAllChats();
-  var f=chats.find(function(c){return c.id===chatId;});
-  if(f)name=f.name;
-  var data=await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages',{chatId:chatId}),msgs=data.messages||[];
-  if(!msgs.length)throw new Error('No messages');
-  var fmt=opts.format||'both',md=buildMD(msgs,name,chatId,opts),json=JSON.stringify(data,null,2);
-  var s=safeFn(name),now=new Date(),ds=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0'),fn=ds+'-'+s+'-Kimi';
-  
-  if(fmt==='both'){
-    var zipFiles=[];
-    zipFiles.push({name:fn+'.md',data:md});
-    zipFiles.push({name:fn+'.json',data:json});
-    var zipData=createZip(zipFiles),blobUrl=URL.createObjectURL(new Blob([zipData],{type:'application/zip'}));
-    await browser.downloads.download({url:blobUrl,filename:fn+'.zip',saveAs:false});
-    setTimeout(function(){URL.revokeObjectURL(blobUrl);},5000);
-  }else if(fmt==='md'){
-    var blobUrl=URL.createObjectURL(new Blob([md],{type:'text/markdown'}));
-    await browser.downloads.download({url:blobUrl,filename:fn+'.md',saveAs:false});
-    setTimeout(function(){URL.revokeObjectURL(blobUrl);},5000);
-  }else{
-    var blobUrl=URL.createObjectURL(new Blob([json],{type:'application/json'}));
-    await browser.downloads.download({url:blobUrl,filename:fn+'.json',saveAs:false});
-    setTimeout(function(){URL.revokeObjectURL(blobUrl);},5000);
+// --- ZIP writer ---
+
+function createZip(files) {
+  var encoder = new TextEncoder();
+  var centralDir = [];
+  var localHeaders = [];
+  var offset = 0;
+  files.forEach(function(f) {
+    var data = typeof f.data === 'string' ? encoder.encode(f.data) : f.data;
+    var nameBytes = encoder.encode(f.name);
+
+    // Local file header (30-byte fixed part + name + data)
+    var local = new Uint8Array(30 + nameBytes.length + data.length);
+    var lv = new DataView(local.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint16(6, 0, true);   // no flags
+    lv.setUint16(8, 0, true);   // method: stored
+    lv.setUint16(10, 0, true);  // mod time
+    lv.setUint16(12, 0, true);  // mod date
+    lv.setUint32(14, crc32(data), true);
+    lv.setUint32(18, data.length, true);
+    lv.setUint32(22, data.length, true);
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);  // extra length
+    local.set(nameBytes, 30);
+    local.set(data, 30 + nameBytes.length);
+    localHeaders.push(local);
+
+    // Central directory entry (46-byte fixed part + name)
+    var cd = new Uint8Array(46 + nameBytes.length);
+    var cv = new DataView(cd.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true);
+    cv.setUint16(6, 20, true);
+    cv.setUint16(8, 0, true);
+    cv.setUint16(10, 0, true);
+    cv.setUint16(12, 0, true);
+    cv.setUint16(14, 0, true);
+    cv.setUint32(16, crc32(data), true);
+    cv.setUint32(20, data.length, true);
+    cv.setUint32(24, data.length, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint16(30, 0, true);
+    cv.setUint16(32, 0, true);
+    cv.setUint16(34, 0, true);
+    cv.setUint32(38, 0, true);
+    cv.setUint32(42, offset, true);
+    cd.set(nameBytes, 46);
+    centralDir.push(cd);
+    offset += local.length;
+  });
+
+  var cdOffset = offset;
+  var cdSize = 0;
+  centralDir.forEach(function(c) { cdSize += c.length; });
+
+  // End of central directory record
+  var eocd = new Uint8Array(22);
+  var ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, files.length, true);
+  ev.setUint16(10, files.length, true);
+  ev.setUint32(12, cdSize, true);
+  ev.setUint32(16, cdOffset, true);
+
+  var result = new Uint8Array(offset + cdSize + 22);
+  var pos = 0;
+  localHeaders.forEach(function(l) { result.set(l, pos); pos += l.length; });
+  centralDir.forEach(function(c) { result.set(c, pos); pos += c.length; });
+  result.set(eocd, pos);
+  return result;
+}
+
+function crc32(data) {
+  var crc = 0xFFFFFFFF;
+  var arr = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  for (var i = 0; i < arr.length; i++) {
+    crc ^= arr[i];
+    for (var j = 0; j < 8; j++) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+// --- Filename helpers ---
+
+// Build the "YYYY-MM-DD-<title>-Kimi" base name plus ZIP-name dedup suffix.
+function buildFileBase(safeTitle, usedNames) {
+  var now = new Date();
+  var dateStamp = now.getFullYear() + '-'
+    + String(now.getMonth() + 1).padStart(2, '0') + '-'
+    + String(now.getDate()).padStart(2, '0');
+  var fileBase = dateStamp + '-' + safeTitle + '-Kimi';
+  if (usedNames[fileBase]) {
+    usedNames[fileBase]++;
+    fileBase = fileBase + '-' + usedNames[fileBase];
+  } else {
+    usedNames[fileBase] = 1;
+  }
+  return fileBase;
+}
+
+// --- Exports ---
+
+async function exportChat(chatId, options) {
+  var name = chatId;
+  var chats = await listAllChats();
+  var found = chats.find(function(c) { return c.id === chatId; });
+  if (found) name = found.name;
+  var data = await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages', { chatId: chatId });
+  var msgs = data.messages || [];
+  if (!msgs.length) throw new Error('No messages');
+  var fmt = options.format || 'both';
+  var md = buildMD(msgs, name, chatId, options);
+  var json = JSON.stringify(data, null, 2);
+  var fileBase = buildFileBase(safeFn(name), {});
+
+  if (fmt === 'both') {
+    var zipData = createZip([
+      { name: fileBase + '.md', data: md },
+      { name: fileBase + '.json', data: json }
+    ]);
+    var zipUrl = URL.createObjectURL(new Blob([zipData], { type: 'application/zip' }));
+    await browser.downloads.download({ url: zipUrl, filename: fileBase + '.zip', saveAs: false });
+    setTimeout(function() { URL.revokeObjectURL(zipUrl); }, 5000);
+  } else if (fmt === 'md') {
+    var mdUrl = URL.createObjectURL(new Blob([md], { type: 'text/markdown' }));
+    await browser.downloads.download({ url: mdUrl, filename: fileBase + '.md', saveAs: false });
+    setTimeout(function() { URL.revokeObjectURL(mdUrl); }, 5000);
+  } else {
+    var jsonUrl = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    await browser.downloads.download({ url: jsonUrl, filename: fileBase + '.json', saveAs: false });
+    setTimeout(function() { URL.revokeObjectURL(jsonUrl); }, 5000);
   }
 }
 
-async function exportAllWithProgress(chatIds, opts) {
+async function exportAllWithProgress(chatIds, options) {
   var allChats = null;
   if (!chatIds || !chatIds.length) {
     allChats = await listAllChats();
-    chatIds = allChats.map(function(c){return c.id;});
+    chatIds = allChats.map(function(c) { return c.id; });
   }
-  var chats = chatIds, total = chats.length, files = [], errs = [], usedNames = {};
-  var nameMap = {}; (allChats||[]).forEach(function(c){ nameMap[c.id] = c.name; });
-  activeExport = {pct: 0, text: '0/'+total};
-  broadcast('progress', {pct: 0, text: '0/'+total});
-  await new Promise(function(r){setTimeout(r, 50);});
+  var chats = chatIds;
+  var total = chats.length;
+  var files = [];
+  var errs = [];
+  var usedNames = {};
+  var nameMap = {};
+  (allChats || []).forEach(function(c) { nameMap[c.id] = c.name; });
+
+  activeExport = { pct: 0, text: '0/' + total };
+  broadcast('progress', { pct: 0, text: '0/' + total });
+  await new Promise(function(r) { setTimeout(r, 50); });
+
   for (var i = 0; i < chats.length; i++) {
-    var cid = chats[i], nm = cid;
+    var chatId = chats[i];
+    var name = chatId;
     try {
-      var data = await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages',{chatId:cid}), msgs = data.messages||[];
-      if (!msgs.length) { errs.push(cid+'|'+nm+'|No messages'); continue; }
-      if (nameMap[cid]) nm = nameMap[cid];
-      var fmt = opts.format||'both', md = buildMD(msgs, nm, cid, opts), s = safeFn(nm);
-      var now = new Date(), ds = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0'), fn = ds+'-'+s+'-Kimi';
-      if (usedNames[fn]) { usedNames[fn]++; fn = fn+'-'+(usedNames[fn]); } else usedNames[fn] = 1;
-      if (fmt==='both'||fmt==='md') files.push({name:fn+'.md', data:md});
-      if (fmt==='both'||fmt==='json') files.push({name:fn+'.json', data:JSON.stringify(data,null,2)});
-    } catch(e) { errs.push(cid+'|'+nm+'|'+e.message); }
-    var pct = Math.round((i+1)/total*100);
-    activeExport = {pct: pct, text: (i+1)+'/'+total};
-    broadcast('progress', {pct: pct, text: (i+1)+'/'+total});
-    await new Promise(function(r){setTimeout(r, 20);});
+      var data = await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages', { chatId: chatId });
+      var msgs = data.messages || [];
+      if (!msgs.length) {
+        errs.push(chatId + '|' + name + '|No messages');
+        continue;
+      }
+      if (nameMap[chatId]) name = nameMap[chatId];
+      var fmt = options.format || 'both';
+      var md = buildMD(msgs, name, chatId, options);
+      var fileBase = buildFileBase(safeFn(name), usedNames);
+      if (fmt === 'both' || fmt === 'md') files.push({ name: fileBase + '.md', data: md });
+      if (fmt === 'both' || fmt === 'json') files.push({ name: fileBase + '.json', data: JSON.stringify(data, null, 2) });
+    } catch (e) {
+      errs.push(chatId + '|' + name + '|' + e.message);
+    }
+    var pct = Math.round((i + 1) / total * 100);
+    activeExport = { pct: pct, text: (i + 1) + '/' + total };
+    broadcast('progress', { pct: pct, text: (i + 1) + '/' + total });
+    await new Promise(function(r) { setTimeout(r, 20); });
   }
-  if (errs.length) files.push({name:'_export-errors.txt', data:errs.join('\n')});
-  var zipData = createZip(files), blobUrl = URL.createObjectURL(new Blob([zipData],{type:'application/zip'}));
-  await browser.downloads.download({url:blobUrl,filename:'Kimi-export-'+new Date().toISOString().split('T')[0]+'.zip',saveAs:false});
-  setTimeout(function(){URL.revokeObjectURL(blobUrl);},5000);
-}
 
-async function exportAll(opts){
-  var chats=await listAllChats();
-  var ids=chats.map(function(c){return c.id;}),files=[],errs=[],usedNames={};
-  browser.action.setBadgeBackgroundColor({color:'#4ade80'});
-  for(var i=0;i<ids.length;i++){
-    var cid=ids[i],nm=cid;
-    browser.action.setBadgeText({text:(i+1)+'/'+ids.length});
-    try{
-      var found=chats.find(function(c){return c.id===cid;});if(found)nm=found.name;
-      var data=await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages',{chatId:cid}),msgs=data.messages||[];
-      if(!msgs.length){errs.push(cid+'|'+nm+'|No messages');continue;}
-      var fmt=opts.format||'both',md=buildMD(msgs,nm,cid,opts),s=safeFn(nm);
-      var now=new Date(),ds=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0'),fn=ds+'-'+s+'-Kimi';
-      if(usedNames[fn]){usedNames[fn]++;fn=fn+'-'+usedNames[fn];}else usedNames[fn]=1;
-      if(fmt==='both'||fmt==='md')files.push({name:fn+'.md',data:md});
-      if(fmt==='both'||fmt==='json')files.push({name:fn+'.json',data:JSON.stringify(data,null,2)});
-    }catch(e){errs.push(cid+'|'+nm+'|'+e.message);}
-  }
-  browser.action.setBadgeText({text:errs.length?'DONE':'OK'});setTimeout(function(){browser.action.setBadgeText({text:''});},3000);
-  if(errs.length)files.push({name:'_export-errors.txt',data:errs.join('\n')});
-  var zipData=createZip(files),blobUrl=URL.createObjectURL(new Blob([zipData],{type:'application/zip'}));
-  await browser.downloads.download({url:blobUrl,filename:'Kimi-export-'+new Date().toISOString().split('T')[0]+'.zip',saveAs:false});
-  setTimeout(function(){URL.revokeObjectURL(blobUrl);},5000);
-}
-
-var opts={thinking:false,tools:false,refs:true,format:'both'};
-browser.storage.local.get(['thinking','tools','format']).then(function(s){opts.thinking=s.thinking||false;opts.tools=s.tools||false;opts.format=s.format||'both';});
-
-browser.runtime.onInstalled.addListener(function(){
-  browser.menus.removeAll(function(){
-    browser.menus.create({id:'export-chat',title:'Export this conversation',contexts:['page'],documentUrlPatterns:['https://www.kimi.com/chat/*']});
-    browser.menus.create({id:'export-all',title:'Export all conversations',contexts:['page'],documentUrlPatterns:['https://www.kimi.com/*']});
+  if (errs.length) files.push({ name: '_export-errors.txt', data: errs.join('\n') });
+  var zipData = createZip(files);
+  var blobUrl = URL.createObjectURL(new Blob([zipData], { type: 'application/zip' }));
+  await browser.downloads.download({
+    url: blobUrl,
+    filename: 'Kimi-export-' + new Date().toISOString().split('T')[0] + '.zip',
+    saveAs: false
   });
-});
+  setTimeout(function() { URL.revokeObjectURL(blobUrl); }, 5000);
+}
+
+async function exportAll(options) {
+  var chats = await listAllChats();
+  var ids = chats.map(function(c) { return c.id; });
+  var files = [];
+  var errs = [];
+  var usedNames = {};
+
+  browser.action.setBadgeBackgroundColor({ color: '#4ade80' });
+
+  for (var i = 0; i < ids.length; i++) {
+    var chatId = ids[i];
+    var name = chatId;
+    browser.action.setBadgeText({ text: (i + 1) + '/' + ids.length });
+    try {
+      var found = chats.find(function(c) { return c.id === chatId; });
+      if (found) name = found.name;
+      var data = await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages', { chatId: chatId });
+      var msgs = data.messages || [];
+      if (!msgs.length) {
+        errs.push(chatId + '|' + name + '|No messages');
+        continue;
+      }
+      var fmt = options.format || 'both';
+      var md = buildMD(msgs, name, chatId, options);
+      var fileBase = buildFileBase(safeFn(name), usedNames);
+      if (fmt === 'both' || fmt === 'md') files.push({ name: fileBase + '.md', data: md });
+      if (fmt === 'both' || fmt === 'json') files.push({ name: fileBase + '.json', data: JSON.stringify(data, null, 2) });
+    } catch (e) {
+      errs.push(chatId + '|' + name + '|' + e.message);
+    }
+  }
+
+  browser.action.setBadgeText({ text: errs.length ? 'DONE' : 'OK' });
+  setTimeout(function() { browser.action.setBadgeText({ text: '' }); }, 3000);
+
+  if (errs.length) files.push({ name: '_export-errors.txt', data: errs.join('\n') });
+  var zipData = createZip(files);
+  var blobUrl = URL.createObjectURL(new Blob([zipData], { type: 'application/zip' }));
+  await browser.downloads.download({
+    url: blobUrl,
+    filename: 'Kimi-export-' + new Date().toISOString().split('T')[0] + '.zip',
+    saveAs: false
+  });
+  setTimeout(function() { URL.revokeObjectURL(blobUrl); }, 5000);
+}
+
+// --- Context menus ---
+
+function createMenus() {
+  browser.menus.removeAll(function() {
+    browser.menus.create({
+      id: 'export-chat',
+      title: 'Export this conversation',
+      contexts: ['page'],
+      documentUrlPatterns: ['https://www.kimi.com/chat/*']
+    });
+    browser.menus.create({
+      id: 'export-all',
+      title: 'Export all conversations',
+      contexts: ['page'],
+      documentUrlPatterns: ['https://www.kimi.com/*']
+    });
+  });
+}
+
+browser.runtime.onInstalled.addListener(createMenus);
 
 // Also register immediately (for first install before onInstalled fires)
-browser.menus.removeAll(function(){
-  browser.menus.create({id:'export-chat',title:'Export this conversation',contexts:['page'],documentUrlPatterns:['https://www.kimi.com/chat/*']});
-  browser.menus.create({id:'export-all',title:'Export all conversations',contexts:['page'],documentUrlPatterns:['https://www.kimi.com/*']});
+createMenus();
+
+browser.menus.onClicked.addListener(async function(info, tab) {
+  if (!tab || !tab.url || !tab.url.includes('kimi.com')) return;
+  var s = await browser.storage.local.get(['thinking', 'tools', 'format']);
+  var opt = { thinking: s.thinking || false, tools: s.tools || false, refs: true, format: s.format || 'both' };
+  if (info.menuItemId === 'export-chat') {
+    var m = tab.url.match(/\/chat\/([a-f0-9-]+)/);
+    if (!m) return;
+    try {
+      activeExport = { pct: 0, text: '' };
+      await exportChat(m[1], opt);
+    } catch (e) {
+      console.error(e);
+    }
+    activeExport = null;
+    broadcast('done', { ok: true });
+  } else if (info.menuItemId === 'export-all') {
+    try {
+      activeExport = { pct: 0, text: '0/0' };
+      await exportAllWithProgress([], opt);
+    } catch (e) {
+      console.error(e);
+    }
+    activeExport = null;
+    broadcast('done', { ok: true });
+  }
 });
 
-browser.menus.onClicked.addListener(async function(info,tab){
-  if(!tab||!tab.url||!tab.url.includes('kimi.com'))return;
-  var s=await browser.storage.local.get(['thinking','tools','format']),opt={thinking:s.thinking||false,tools:s.tools||false,refs:true,format:s.format||'both'};
-  if(info.menuItemId==='export-chat'){
-    var m=tab.url.match(/\/chat\/([a-f0-9-]+)/);if(!m)return;
-    try{activeExport={pct:0,text:''};await exportChat(m[1],opt);}catch(e){console.error(e);}
-    activeExport=null;broadcast('done',{ok:true});
-  }
-  else if(info.menuItemId==='export-all'){
-    try{activeExport={pct:0,text:'0/0'};await exportAllWithProgress([],opt);}catch(e){console.error(e);}
-    activeExport=null;broadcast('done',{ok:true});
-  }
+// --- Startup ---
+
+browser.storage.local.get(['thinking', 'tools', 'format']).then(function(s) {
+  opts.thinking = s.thinking || false;
+  opts.tools = s.tools || false;
+  opts.format = s.format || 'both';
 });
 
 console.log('Kimi Export ready');
