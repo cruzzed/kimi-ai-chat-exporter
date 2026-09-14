@@ -31,7 +31,7 @@ function connectExport(){
 async function init(){
   // Connect to background (will receive active export progress immediately)
   connectExport();
-  
+
   var s=await browser.storage.local.get(['thinking','tools','format']);
   toggles.thinking=s.thinking||false;toggles.tools=s.tools||false;
   format=s.format||'both';
@@ -44,7 +44,7 @@ async function init(){
   });
   var tabs=await browser.tabs.query({active:true,currentWindow:true});
   var url=tabs[0].url||'',m=url.match(/\/chat\/([a-f0-9-]+)/);
-  isChat=!!(m&&url.includes('kimi.com'));chatId=m?m[1]:null;
+  isChat=!!(m&&url.includes('kimi.ai'));chatId=m?m[1]:null;
   document.querySelectorAll('.toggle').forEach(function(t){
     var k=t.dataset.key;if(toggles[k])t.classList.add('on');
     t.addEventListener('click',function(){toggles[k]=!toggles[k];t.classList.toggle('on',toggles[k]);browser.storage.local.set({[k]:toggles[k]});});

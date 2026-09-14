@@ -11,7 +11,7 @@
     "scripting"
   ],
   "host_permissions": [
-    "https://www.kimi.com/*"
+    "https://www.kimi.ai/*"
   ],
   "browser_specific_settings": {
     "gecko": {
@@ -40,7 +40,7 @@
   "content_scripts": [
     {
       "matches": [
-        "https://www.kimi.com/*"
+        "https://www.kimi.ai/*"
       ],
       "js": [
         "content.js"
@@ -49,6 +49,6 @@
     }
   ],
   "content_security_policy": {
-    "extension_pages": "default-src 'self'; connect-src 'self' https://www.kimi.com"
+    "extension_pages": "default-src 'self'; connect-src 'self' https://www.kimi.ai"
   }
 }

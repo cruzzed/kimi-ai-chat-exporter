@@ -113,12 +113,12 @@ function safeFn(n){return(n||'untitled').replace(/[\\/:*?"<>|]/g,'-').replace(/-
 
 var KIMI_HEADERS={'Content-Type':'application/json','connect-protocol-version':'1','x-msh-platform':'web','x-msh-version':'1.0.0','x-language':'en-US'};
 
-async function getToken(){if(authToken)return authToken;var tabs=await browser.tabs.query({url:'https://www.kimi.com/*'});if(tabs.length)return new Promise(function(resolve){browser.scripting.executeScript({target:{tabId:tabs[0].id},func:function(){return localStorage.getItem('access_token');}}).then(function(results){if(results&&results[0]&&results[0].result)authToken=results[0].result;resolve(authToken);});});return null;}
+async function getToken(){if(authToken)return authToken;var tabs=await browser.tabs.query({url:'https://www.kimi.ai/*'});if(tabs.length)return new Promise(function(resolve){browser.scripting.executeScript({target:{tabId:tabs[0].id},func:function(){return localStorage.getItem('access_token');}}).then(function(results){if(results&&results[0]&&results[0].result)authToken=results[0].result;resolve(authToken);});});return null;}
 
 async function kimiFetch(endpoint,body){
   var token=await getToken(),headers=Object.assign({},KIMI_HEADERS);
   if(token)headers['Authorization']='Bearer '+token;
-  var r=await fetch('https://www.kimi.com'+endpoint,{method:'POST',headers:headers,body:JSON.stringify(body),credentials:'include'});
+  var r=await fetch('https://www.kimi.ai'+endpoint,{method:'POST',headers:headers,body:JSON.stringify(body),credentials:'include'});
   if(!r.ok){var t=await r.text();throw new Error(r.status===401||r.status===403?'Not logged into Kimi':'API error '+r.status+': '+t.substring(0,100));}
   return r.json();
 }
@@ -158,7 +158,7 @@ async function exportChat(chatId,opts){
   if(!msgs.length)throw new Error('No messages');
   var fmt=opts.format||'both',md=buildMD(msgs,name,chatId,opts),json=JSON.stringify(data,null,2);
   var s=safeFn(name),now=new Date(),ds=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0'),fn=ds+'-'+s+'-Kimi';
-  
+
   if(fmt==='both'){
     var zipFiles=[];
     zipFiles.push({name:fn+'.md',data:md});
@@ -239,19 +239,19 @@ browser.storage.local.get(['thinking','tools','format']).then(function(s){opts.t
 
 browser.runtime.onInstalled.addListener(function(){
   browser.menus.removeAll(function(){
-    browser.menus.create({id:'export-chat',title:'Export this conversation',contexts:['page'],documentUrlPatterns:['https://www.kimi.com/chat/*']});
-    browser.menus.create({id:'export-all',title:'Export all conversations',contexts:['page'],documentUrlPatterns:['https://www.kimi.com/*']});
+    browser.menus.create({id:'export-chat',title:'Export this conversation',contexts:['page'],documentUrlPatterns:['https://www.kimi.ai/chat/*']});
+    browser.menus.create({id:'export-all',title:'Export all conversations',contexts:['page'],documentUrlPatterns:['https://www.kimi.ai/*']});
   });
 });
 
 // Also register immediately (for first install before onInstalled fires)
 browser.menus.removeAll(function(){
-  browser.menus.create({id:'export-chat',title:'Export this conversation',contexts:['page'],documentUrlPatterns:['https://www.kimi.com/chat/*']});
-  browser.menus.create({id:'export-all',title:'Export all conversations',contexts:['page'],documentUrlPatterns:['https://www.kimi.com/*']});
+  browser.menus.create({id:'export-chat',title:'Export this conversation',contexts:['page'],documentUrlPatterns:['https://www.kimi.ai/chat/*']});
+  browser.menus.create({id:'export-all',title:'Export all conversations',contexts:['page'],documentUrlPatterns:['https://www.kimi.ai/*']});
 });
 
 browser.menus.onClicked.addListener(async function(info,tab){
-  if(!tab||!tab.url||!tab.url.includes('kimi.com'))return;
+  if(!tab||!tab.url||!tab.url.includes('kimi.ai'))return;
   var s=await browser.storage.local.get(['thinking','tools','format']),opt={thinking:s.thinking||false,tools:s.tools||false,refs:true,format:s.format||'both'};
   if(info.menuItemId==='export-chat'){
     var m=tab.url.match(/\/chat\/([a-f0-9-]+)/);if(!m)return;
