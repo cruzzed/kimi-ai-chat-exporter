@@ -54,10 +54,29 @@ browser.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   if (msg.type === 'exportBatch') { exportAll(msg.options||{}).then(function(){sendResponse({ok:true});}).catch(function(e){sendResponse({ok:false,error:e.message});}); return true; }
 });
 
+function nextToken(d){return d.nextPageToken||d.next_page_token||d.nextToken||d.next_token||null;}
+
+async function listAllChats(){
+  var chats=[],token=null,guard=0;
+  do{
+    var body=token?{page_size:50,page_token:token,query:''}:{page_size:50,query:''};
+    var d=await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats',body);
+    var page=d.chats||[];
+    if(!page.length)break;
+    chats=chats.concat(page);
+    token=nextToken(d);
+    if(token&&page.length<50)break; // no more pages
+    if(++guard>200)break; // safety
+  }while(token);
+  return chats;
+}
+
 async function handleGetChatInfo(chatId) {
   try {
-    var name=chatId,createTime=null,token=null;
-    do{var body=token?{page_size:50,page_token:token,query:''}:{page_size:50,query:''};var d=await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats',body);var f=(d.chats||[]).find(function(c){return c.id===chatId;});if(f){name=f.name;createTime=f.createTime;break;}token=d.nextPageToken;}while(token);
+    var name=chatId,createTime=null;
+    var chats=await listAllChats();
+    var f=chats.find(function(c){return c.id===chatId;});
+    if(f){name=f.name;createTime=f.createTime;}
     var data=await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages',{chatId:chatId});var msgs=data.messages||[];
     return{ok:true,title:name,messageCount:msgs.length,date:createTime||(msgs.length?msgs[msgs.length-1].createTime:'Unknown')};
   }catch(e){return{ok:false,error:e.message};}
@@ -65,16 +84,17 @@ async function handleGetChatInfo(chatId) {
 
 async function handleListChats() {
   try {
-    var chats=[],token=null;
-    do{var body=token?{page_size:50,page_token:token,query:''}:{page_size:50,query:''};var d=await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats',body);var pageChats=d.chats||[];if(!pageChats.length)break;chats=chats.concat(pageChats);token=d.nextPageToken;}while(token);
+    var chats=await listAllChats();
     return{ok:true,chats:chats.map(function(c){return{id:c.id,name:c.name,createTime:c.createTime,updateTime:c.updateTime};})};
   }catch(e){return{ok:false,error:e.message};}
 }
 
 async function handleGetChatText(chatId, opts) {
   try {
-    var name=chatId,token=null;
-    do{var body=token?{page_size:50,page_token:token,query:''}:{page_size:50,query:''};var d=await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats',body);var f=(d.chats||[]).find(function(c){return c.id===chatId;});if(f){name=f.name;break;}token=d.nextPageToken;}while(token);
+    var name=chatId;
+    var chats=await listAllChats();
+    var f=chats.find(function(c){return c.id===chatId;});
+    if(f)name=f.name;
     var data=await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages',{chatId:chatId});
     var msgs=data.messages||[];
     if(!msgs.length)return{ok:false,error:'No messages'};
@@ -152,8 +172,10 @@ function buildMD(msgs,title,chatId,opts){
 }
 
 async function exportChat(chatId,opts){
-  var name=chatId,token=null;
-  do{var body=token?{page_size:50,page_token:token,query:''}:{page_size:50,query:''};var d=await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats',body);var f=(d.chats||[]).find(function(c){return c.id===chatId;});if(f){name=f.name;break;}token=d.nextPageToken;}while(token);
+  var name=chatId;
+  var chats=await listAllChats();
+  var f=chats.find(function(c){return c.id===chatId;});
+  if(f)name=f.name;
   var data=await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages',{chatId:chatId}),msgs=data.messages||[];
   if(!msgs.length)throw new Error('No messages');
   var fmt=opts.format||'both',md=buildMD(msgs,name,chatId,opts),json=JSON.stringify(data,null,2);
@@ -178,12 +200,13 @@ async function exportChat(chatId,opts){
 }
 
 async function exportAllWithProgress(chatIds, opts) {
+  var allChats = null;
   if (!chatIds || !chatIds.length) {
-    var allChats = [], token = null;
-    do { var body = token ? {page_size:50,page_token:token,query:''} : {page_size:50,query:''}; var d = await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats',body); if (!(d.chats||[]).length) break; allChats = allChats.concat(d.chats); token = d.nextPageToken; } while (token);
-    chatIds = allChats.map(function(c){return c.id;}).slice(0,50);
+    allChats = await listAllChats();
+    chatIds = allChats.map(function(c){return c.id;});
   }
-  var chats = chatIds.slice(0, 50), total = chats.length, files = [], errs = [];
+  var chats = chatIds, total = chats.length, files = [], errs = [], usedNames = {};
+  var nameMap = {}; (allChats||[]).forEach(function(c){ nameMap[c.id] = c.name; });
   activeExport = {pct: 0, text: '0/'+total};
   broadcast('progress', {pct: 0, text: '0/'+total});
   await new Promise(function(r){setTimeout(r, 50);});
@@ -192,9 +215,10 @@ async function exportAllWithProgress(chatIds, opts) {
     try {
       var data = await kimiFetch('/apiv2/kimi.gateway.chat.v1.ChatService/ListMessages',{chatId:cid}), msgs = data.messages||[];
       if (!msgs.length) { errs.push(cid+'|'+nm+'|No messages'); continue; }
-      try { var cd = await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats',{page_size:50,query:''}); var found = (cd.chats||[]).find(function(c){return c.id===cid;}); if (found) nm = found.name; } catch(e) {}
+      if (nameMap[cid]) nm = nameMap[cid];
       var fmt = opts.format||'both', md = buildMD(msgs, nm, cid, opts), s = safeFn(nm);
       var now = new Date(), ds = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0'), fn = ds+'-'+s+'-Kimi';
+      if (usedNames[fn]) { usedNames[fn]++; fn = fn+'-'+(usedNames[fn]); } else usedNames[fn] = 1;
       if (fmt==='both'||fmt==='md') files.push({name:fn+'.md', data:md});
       if (fmt==='both'||fmt==='json') files.push({name:fn+'.json', data:JSON.stringify(data,null,2)});
     } catch(e) { errs.push(cid+'|'+nm+'|'+e.message); }
@@ -210,9 +234,8 @@ async function exportAllWithProgress(chatIds, opts) {
 }
 
 async function exportAll(opts){
-  var chats=[],token=null;
-  do{var body=token?{page_size:50,page_token:token,query:''}:{page_size:50,query:''};var d=await kimiFetch('/apiv2/kimi.chat.v1.ChatService/ListChats',body);if(!(d.chats||[]).length)break;chats=chats.concat(d.chats);token=d.nextPageToken;}while(token);
-  var ids=chats.map(function(c){return c.id;}).slice(0,50),files=[],errs=[];
+  var chats=await listAllChats();
+  var ids=chats.map(function(c){return c.id;}),files=[],errs=[],usedNames={};
   browser.action.setBadgeBackgroundColor({color:'#4ade80'});
   for(var i=0;i<ids.length;i++){
     var cid=ids[i],nm=cid;
@@ -223,6 +246,7 @@ async function exportAll(opts){
       if(!msgs.length){errs.push(cid+'|'+nm+'|No messages');continue;}
       var fmt=opts.format||'both',md=buildMD(msgs,nm,cid,opts),s=safeFn(nm);
       var now=new Date(),ds=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0'),fn=ds+'-'+s+'-Kimi';
+      if(usedNames[fn]){usedNames[fn]++;fn=fn+'-'+usedNames[fn];}else usedNames[fn]=1;
       if(fmt==='both'||fmt==='md')files.push({name:fn+'.md',data:md});
       if(fmt==='both'||fmt==='json')files.push({name:fn+'.json',data:JSON.stringify(data,null,2)});
     }catch(e){errs.push(cid+'|'+nm+'|'+e.message);}
