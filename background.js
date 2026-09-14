@@ -7,6 +7,9 @@ var authToken = null;
 var activeExport = null;
 var exportPorts = [];
 
+// Upper bound for request pacing delays.
+var MAX_REQUEST_DELAY = 10000;
+
 var PUA = /[\ue000-\uf8ff]/g;
 var KIMI_HEADERS = {
   'Content-Type': 'application/json',
@@ -17,7 +20,23 @@ var KIMI_HEADERS = {
 };
 
 // Default export options (synced from storage on startup).
-var opts = { thinking: false, tools: false, refs: true, format: 'both' };
+var opts = { thinking: false, tools: false, refs: true, format: 'both', requestDelay: 250 };
+
+// --- Request pacing helpers ---
+
+function sleep(ms) {
+  return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+
+// Read the base per-request delay (ms) from storage; fall back to the
+// cached startup value, then to 250 ms.
+async function getRequestDelay() {
+  try {
+    var s = await browser.storage.local.get('requestDelay');
+    if (s.requestDelay) return s.requestDelay;
+  } catch (e) { /* storage unavailable — use fallback */ }
+  return opts.requestDelay || 250;
+}
 
 // --- Messaging (progress broadcast + port lifecycle) ---
 
@@ -93,7 +112,7 @@ browser.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
 
 async function getToken() {
   if (authToken) return authToken;
-  var tabs = await browser.tabs.query({ url: 'https://www.kimi.com/*' });
+  var tabs = await browser.tabs.query({ url: 'https://www.kimi.ai/*' });
   if (!tabs.length) return null;
   return new Promise(function(resolve) {
     browser.scripting.executeScript({
@@ -106,22 +125,56 @@ async function getToken() {
   });
 }
 
-async function kimiFetch(endpoint, body) {
+// Single request attempt. Errors carry flags so the retry wrapper can
+// distinguish auth failures (no retry) from retryable failures.
+async function kimiFetchOnce(endpoint, body) {
   var token = await getToken();
   var headers = Object.assign({}, KIMI_HEADERS);
   if (token) headers['Authorization'] = 'Bearer ' + token;
-  var r = await fetch('https://www.kimi.com' + endpoint, {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify(body),
-    credentials: 'include'
-  });
+  var r;
+  try {
+    r = await fetch('https://www.kimi.ai' + endpoint, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(body),
+      credentials: 'include'
+    });
+  } catch (e) {
+    e.networkError = true; // NetworkError / CORS / offline
+    throw e;
+  }
   if (!r.ok) {
     var text = await r.text();
-    if (r.status === 401 || r.status === 403) throw new Error('Not logged into Kimi');
-    throw new Error('API error ' + r.status + ': ' + text.substring(0, 100));
+    var err;
+    if (r.status === 401 || r.status === 403) {
+      err = new Error('Not logged into Kimi');
+      err.authError = true;
+    } else {
+      err = new Error('API error ' + r.status + ': ' + text.substring(0, 100));
+    }
+    err.status = r.status;
+    throw err;
   }
   return r.json();
+}
+
+// Retries network failures and 429/5xx responses with linear backoff
+// (baseDelay * attempt, up to 4 attempts total). 401/403 fail immediately.
+async function kimiFetch(endpoint, body) {
+  var baseDelay = await getRequestDelay();
+  var lastError = null;
+  for (var attempt = 1; attempt <= 4; attempt++) {
+    try {
+      return await kimiFetchOnce(endpoint, body);
+    } catch (e) {
+      lastError = e;
+      if (e.authError) throw e;
+      var retryable = e.networkError || e.status === 429 || (e.status >= 500 && e.status < 600);
+      if (!retryable || attempt === 4) throw e;
+      await sleep(baseDelay * attempt);
+    }
+  }
+  throw lastError;
 }
 
 // --- Chat listing ---
@@ -421,6 +474,7 @@ async function exportChat(chatId, options) {
 }
 
 async function exportAllWithProgress(chatIds, options) {
+  var baseDelay = await getRequestDelay();
   var allChats = null;
   if (!chatIds || !chatIds.length) {
     allChats = await listAllChats();
@@ -436,9 +490,11 @@ async function exportAllWithProgress(chatIds, options) {
 
   activeExport = { pct: 0, text: '0/' + total };
   broadcast('progress', { pct: 0, text: '0/' + total });
-  await new Promise(function(r) { setTimeout(r, 50); });
 
   for (var i = 0; i < chats.length; i++) {
+    // Linear pacing: chat 1 fires immediately, chat 2 waits baseDelay, etc.
+    var pause = Math.min(baseDelay * i, MAX_REQUEST_DELAY);
+    if (pause > 0) await sleep(pause);
     var chatId = chats[i];
     var name = chatId;
     try {
@@ -458,9 +514,9 @@ async function exportAllWithProgress(chatIds, options) {
       errs.push(chatId + '|' + name + '|' + e.message);
     }
     var pct = Math.round((i + 1) / total * 100);
-    activeExport = { pct: pct, text: (i + 1) + '/' + total };
-    broadcast('progress', { pct: pct, text: (i + 1) + '/' + total });
-    await new Promise(function(r) { setTimeout(r, 20); });
+    var progressText = (i + 1) + '/' + total + ' (+' + (pause / 1000).toFixed(1) + 's pause)';
+    activeExport = { pct: pct, text: progressText };
+    broadcast('progress', { pct: pct, text: progressText });
   }
 
   if (errs.length) files.push({ name: '_export-errors.txt', data: errs.join('\n') });
@@ -475,6 +531,7 @@ async function exportAllWithProgress(chatIds, options) {
 }
 
 async function exportAll(options) {
+  var baseDelay = await getRequestDelay();
   var chats = await listAllChats();
   var ids = chats.map(function(c) { return c.id; });
   var files = [];
@@ -484,6 +541,9 @@ async function exportAll(options) {
   browser.action.setBadgeBackgroundColor({ color: '#4ade80' });
 
   for (var i = 0; i < ids.length; i++) {
+    // Linear pacing: chat 1 fires immediately, chat 2 waits baseDelay, etc.
+    var pause = Math.min(baseDelay * i, MAX_REQUEST_DELAY);
+    if (pause > 0) await sleep(pause);
     var chatId = ids[i];
     var name = chatId;
     browser.action.setBadgeText({ text: (i + 1) + '/' + ids.length });
@@ -528,13 +588,13 @@ function createMenus() {
       id: 'export-chat',
       title: 'Export this conversation',
       contexts: ['page'],
-      documentUrlPatterns: ['https://www.kimi.com/chat/*']
+      documentUrlPatterns: ['https://www.kimi.ai/chat/*']
     });
     browser.menus.create({
       id: 'export-all',
       title: 'Export all conversations',
       contexts: ['page'],
-      documentUrlPatterns: ['https://www.kimi.com/*']
+      documentUrlPatterns: ['https://www.kimi.ai/*']
     });
   });
 }
@@ -545,7 +605,7 @@ browser.runtime.onInstalled.addListener(createMenus);
 createMenus();
 
 browser.menus.onClicked.addListener(async function(info, tab) {
-  if (!tab || !tab.url || !tab.url.includes('kimi.com')) return;
+  if (!tab || !tab.url || !tab.url.includes('kimi.ai')) return;
   var s = await browser.storage.local.get(['thinking', 'tools', 'format']);
   var opt = { thinking: s.thinking || false, tools: s.tools || false, refs: true, format: s.format || 'both' };
   if (info.menuItemId === 'export-chat') {
@@ -573,10 +633,11 @@ browser.menus.onClicked.addListener(async function(info, tab) {
 
 // --- Startup ---
 
-browser.storage.local.get(['thinking', 'tools', 'format']).then(function(s) {
+browser.storage.local.get(['thinking', 'tools', 'format', 'requestDelay']).then(function(s) {
   opts.thinking = s.thinking || false;
   opts.tools = s.tools || false;
   opts.format = s.format || 'both';
+  opts.requestDelay = s.requestDelay || 250;
 });
 
 console.log('Kimi Export ready');

@@ -3,8 +3,8 @@
 @media(prefers-color-scheme:dark){:root{--bg:var(--toolbar-bgcolor,#1c1b22);--fg:var(--lwt-text-color,#fbfbfe);--surface:var(--toolbar-field-background-color,#2b2a33)}}
 body{width:300px;font:14px/20px -apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--fg)}
 #hostname{background:var(--surface);padding:4px 8px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#formatRow{display:flex;justify-content:center;gap:8px;padding:8px 0 0}
-.fmt{cursor:pointer;font-size:10px;padding:2px 6px;border-radius:3px;display:flex;align-items:center;gap:3px}.fmt .dot{width:8px;height:8px;border-radius:50%;border:2px solid var(--fg);opacity:.4;display:inline-block}.fmt.sel .dot{background:var(--fg);opacity:1}.fmt.sel{font-weight:600}
+#formatRow,#delayRow{display:flex;justify-content:center;gap:8px;padding:8px 0 0}
+.fmt,.dly{cursor:pointer;font-size:10px;padding:2px 6px;border-radius:3px;display:flex;align-items:center;gap:3px}.fmt .dot,.dly .dot{width:8px;height:8px;border-radius:50%;border:2px solid var(--fg);opacity:.4;display:inline-block}.fmt.sel .dot,.dly.sel .dot{background:var(--fg);opacity:1}.fmt.sel,.dly.sel{font-weight:600}
 #toggleRow{display:flex;justify-content:center;gap:16px;padding:8px 0}
 .toggle{cursor:pointer;text-align:center;user-select:none}.toggle .icon{font-size:16px;opacity:.35;font-weight:700}.toggle .label{display:block;font-size:10px;margin-top:2px}
 .toggle.on .icon{opacity:.7}.toggle.on .label{font-weight:600}

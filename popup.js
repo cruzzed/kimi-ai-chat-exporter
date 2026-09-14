@@ -1,4 +1,4 @@
-var chatId=null,isChat=false,selected=new Set(),toggles={thinking:false,tools:false},format='both';
+var chatId=null,isChat=false,selected=new Set(),toggles={thinking:false,tools:false},format='both',requestDelay=250;
 var hn=document.getElementById('hostname'),tr=document.getElementById('toggleRow');
 var st=document.getElementById('stats'),cl=document.getElementById('chatList');
 var sc=document.getElementById('selectCount'),eb=document.getElementById('exportBtn');
@@ -31,10 +31,10 @@ function connectExport(){
 async function init(){
   // Connect to background (will receive active export progress immediately)
   connectExport();
-  
-  var s=await browser.storage.local.get(['thinking','tools','format']);
+
+  var s=await browser.storage.local.get(['thinking','tools','format','requestDelay']);
   toggles.thinking=s.thinking||false;toggles.tools=s.tools||false;
-  format=s.format||'both';
+  format=s.format||'both';requestDelay=s.requestDelay||250;
   document.querySelectorAll('.fmt').forEach(function(f){
     if(f.dataset.fmt===format)f.classList.add('sel');
     f.addEventListener('click',function(){
@@ -42,9 +42,16 @@ async function init(){
       f.classList.add('sel');format=f.dataset.fmt;browser.storage.local.set({format:format});
     });
   });
+  document.querySelectorAll('.dly').forEach(function(d){
+    if(parseInt(d.dataset.delay,10)===requestDelay)d.classList.add('sel');
+    d.addEventListener('click',function(){
+      document.querySelectorAll('.dly').forEach(function(x){x.classList.remove('sel');});
+      d.classList.add('sel');requestDelay=parseInt(d.dataset.delay,10);browser.storage.local.set({requestDelay:requestDelay});
+    });
+  });
   var tabs=await browser.tabs.query({active:true,currentWindow:true});
   var url=tabs[0].url||'',m=url.match(/\/chat\/([a-f0-9-]+)/);
-  isChat=!!(m&&url.includes('kimi.com'));chatId=m?m[1]:null;
+  isChat=!!(m&&url.includes('kimi.ai'));chatId=m?m[1]:null;
   document.querySelectorAll('.toggle').forEach(function(t){
     var k=t.dataset.key;if(toggles[k])t.classList.add('on');
     t.addEventListener('click',function(){toggles[k]=!toggles[k];t.classList.toggle('on',toggles[k]);browser.storage.local.set({[k]:toggles[k]});});
