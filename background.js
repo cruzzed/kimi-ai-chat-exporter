@@ -110,8 +110,9 @@ browser.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
 
 // --- API client ---
 
-async function getToken() {
-  if (authToken) return authToken;
+async function getToken(forceRefresh) {
+  if (authToken && !forceRefresh) return authToken;
+  if (forceRefresh) authToken = null;
   var tabs = await browser.tabs.query({ url: 'https://www.kimi.ai/*' });
   if (!tabs.length) return null;
   return new Promise(function(resolve) {
@@ -159,7 +160,9 @@ async function kimiFetchOnce(endpoint, body) {
 }
 
 // Retries network failures and 429/5xx responses with linear backoff
-// (baseDelay * attempt, up to 4 attempts total). 401/403 fail immediately.
+// (baseDelay * attempt, up to 4 attempts total). 401/403 refreshes the
+// cached token once — it expires after ~15 min while the background page
+// can live for hours — then fails if the retry still doesn't authenticate.
 async function kimiFetch(endpoint, body) {
   var baseDelay = await getRequestDelay();
   var lastError = null;
@@ -168,7 +171,19 @@ async function kimiFetch(endpoint, body) {
       return await kimiFetchOnce(endpoint, body);
     } catch (e) {
       lastError = e;
-      if (e.authError) throw e;
+      if (e.authError) {
+        if (!e.retriedAfterRefresh) {
+          // Re-read access_token from the kimi.ai page and retry once.
+          await getToken(true);
+          e.retriedAfterRefresh = true;
+          try {
+            return await kimiFetchOnce(endpoint, body);
+          } catch (e2) {
+            throw e2.authError ? new Error('Not logged into Kimi') : e2;
+          }
+        }
+        throw e;
+      }
       var retryable = e.networkError || e.status === 429 || (e.status >= 500 && e.status < 600);
       if (!retryable || attempt === 4) throw e;
       await sleep(baseDelay * attempt);
