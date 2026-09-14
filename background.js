@@ -113,13 +113,20 @@ function safeFn(n){return(n||'untitled').replace(/[\\/:*?"<>|]/g,'-').replace(/-
 
 var KIMI_HEADERS={'Content-Type':'application/json','connect-protocol-version':'1','x-msh-platform':'web','x-msh-version':'1.0.0','x-language':'en-US'};
 
-async function getToken(){if(authToken)return authToken;var tabs=await browser.tabs.query({url:'https://www.kimi.com/*'});if(tabs.length)return new Promise(function(resolve){browser.scripting.executeScript({target:{tabId:tabs[0].id},func:function(){return localStorage.getItem('access_token');}}).then(function(results){if(results&&results[0]&&results[0].result)authToken=results[0].result;resolve(authToken);});});return null;}
+async function getToken(forceRefresh){
+  if(authToken&&!forceRefresh)return authToken;
+  if(forceRefresh)authToken=null;
+  var tabs=await browser.tabs.query({url:'https://www.kimi.com/*'});if(tabs.length)return new Promise(function(resolve){browser.scripting.executeScript({target:{tabId:tabs[0].id},func:function(){return localStorage.getItem('access_token');}}).then(function(results){if(results&&results[0]&&results[0].result)authToken=results[0].result;resolve(authToken);});});return null;}
 
-async function kimiFetch(endpoint,body){
+async function kimiFetch(endpoint,body,allowRetry){
   var token=await getToken(),headers=Object.assign({},KIMI_HEADERS);
   if(token)headers['Authorization']='Bearer '+token;
   var r=await fetch('https://www.kimi.com'+endpoint,{method:'POST',headers:headers,body:JSON.stringify(body),credentials:'include'});
-  if(!r.ok){var t=await r.text();throw new Error(r.status===401||r.status===403?'Not logged into Kimi':'API error '+r.status+': '+t.substring(0,100));}
+  if(!r.ok){
+    // Token may have expired since we cached it — re-read from the page and try once more.
+    if((r.status===401||r.status===403)&&allowRetry!==false)return kimiFetch(endpoint,body,false);
+    var t=await r.text();throw new Error(r.status===401||r.status===403?'Not logged into Kimi':'API error '+r.status+': '+t.substring(0,100));
+  }
   return r.json();
 }
 
